@@ -1,0 +1,232 @@
+#!/usr/bin/python3
+
+import email
+import email.parser
+import email.header
+import sys
+import sqlite3
+import os
+import argparse
+import traceback
+import dateutil.parser
+from matplotlib import pyplot
+import re
+import logging
+
+DATABASE = os.path.expanduser('~/maillog.db')
+HIST_FILE = '/tmp/hist/{}.png'
+RSPAMD_SCORE = 7.0
+SA_SCORE = 7.0
+conn = None
+c = None
+logger = logging.getLogger('maillog')
+logger.setLevel(logging.INFO)
+
+def dbinit():
+    global conn
+    global c
+    create_table = not os.path.exists(DATABASE)
+    conn = sqlite3.connect(DATABASE)
+    c = conn.cursor()
+    if create_table:
+        c.execute('CREATE TABLE mails (id TEXT, received INT, "from" TEXT, "to" TEXT, subject TEXT, rspamd_score REAL, rspamd_bayes REAL, spamass_score REAL, spamass_bayes REAL, spam INT,'
+                  'CONSTRAINT pk PRIMARY KEY (id, received))')
+
+
+def dbclose():
+    global conn
+    conn.commit()
+    conn.close()
+
+
+def parse_mail():
+    mail = ''
+    for line in sys.stdin:
+        if line == '\n':
+            for _ in sys.stdin:
+                pass
+            break
+        mail += line
+    parser = email.parser.HeaderParser()
+    try:
+        headers = parser.parsestr(mail)
+    except:
+        logger.error('failed to parse mail')
+        logger.error(mail)
+        raise
+    logger.info('mail parsed')
+    return headers
+
+
+def insert(id, rcv, fr, to, subject, rspam, rspam_b, sa, sa_b, spam):
+    global c
+    sql = 'INSERT INTO mails(id, received, "from", "to", subject, rspamd_score, rspamd_bayes, spamass_score, spamass_bayes, spam) VALUES(?,?,?,?,?,?,?,?,?,?)'
+    record = (id, rcv, fr, to, subject, rspam, rspam_b, sa, sa_b, spam)
+    c.execute(sql, record)
+    conn.commit()
+    return c.lastrowid
+
+
+def update(id, spam):
+    global c
+    sql = 'UPDATE mails SET spam=? WHERE id=?'
+    c.execute(sql, (spam, id))
+    conn.commit()
+    return c.lastrowid
+
+
+def update_hist(type, border, bins):
+    global c
+    if not os.path.exists(os.path.dirname(HIST_FILE)):
+        os.makedirs(os.path.dirname(HIST_FILE))
+        os.chmod(os.path.dirname(HIST_FILE), 0o755)
+    c.execute("SELECT {}, spam FROM mails".format(type))
+    data = [x for x in c.fetchall()  if x[0] is not None]
+    if not data:
+        return
+
+    ham = ([x[0] for x in data if x[1] == 0 and x[0] < border],
+           'ham',
+           'green')
+
+    spam = ([x[0] for x in data if x[1] == 1 and x[0] >= border],
+            'spam',
+            'blue')
+
+    fn = ([x[0] for x in data if x[0] < border and x[1] == 1],
+          'false negative',
+          'yellow')
+
+    fp = ([x[0] for x in data if x[0] >= border and x[1] == 0],
+          'false positive',
+          'red')
+
+    value, label, color = zip(ham, fp, spam, fn)
+
+    label = ['{}: {}'.format(label[x], len(value[x])) for x in range(len(value))]
+
+    pyplot.cla()
+    pyplot.hist(value,
+                color=color,
+                label=label,
+                bins=bins, stacked=True,)
+    pyplot.axvline(x=border, color='black')
+    pyplot.legend(loc='upper right')
+    pyplot.title(type)
+    pyplot.savefig(HIST_FILE.format(type))
+    os.chmod(HIST_FILE.format(type), 0o644)
+def get_received(headers):
+    try:
+        return int(dateutil.parser.parse(headers.get('Received').split(';')[1].strip()).timestamp())
+    except:
+        return None
+
+def get_rspamd_score(headers):
+    #X-RSpamd-Status: No, score=-7.90
+    try:
+        return float(headers.get('X-RSpamd-Status').split(',')[1].strip().split('=')[1])
+    except:
+        return None
+
+def get_rspamd_bayes(headers):
+    #BAYES_HAM(-2.99)[99.94%];
+    try:
+        r = re.compile(r'(?P<name>[A-Z_0-9]+)\((?P<score>[-0-9.]+)\)\[(?P<detail>[^]]*)\]')
+        spamd_result = headers.get('X-Spamd-Result').split(';')[1:]
+        for score in spamd_result:
+            m = r.fullmatch(score.strip())
+            if m:
+                if m.group(1) == 'BAYES_HAM':
+                    mult = -1
+                elif m.group(1) == 'BAYES_SPAM':
+                    mult = 1
+                else:
+                    continue
+
+                return mult * float(m.group(3).rstrip('%'))
+    except:
+        return None
+
+
+def get_spamass_bayes(headers):
+    try:
+        bayes_status = [ x for x in headers.get('X-Spam-Status').split() if x.startswith('bayes=') ]
+        if not bayes_status:
+            return
+
+        bayes_score = float(bayes_status[0].replace('bayes=', '').strip())
+        if bayes_score != 0.5:
+            return bayes_score
+    except:
+        return None
+
+
+def get_spamass_score(headers):
+    #X-Spam-Status: No, score=3.1
+    try:
+        return float(headers.get('X-Spam-Status').split(',')[1].lstrip().split()[0].split('=')[1])
+    except:
+        return None
+
+def get_header(headers, id, default):
+    encoded = headers.get(id, default)
+    try:
+        result = []
+        for part in email.header.decode_header(encoded):
+            result.append(part[0] if type(part[0]) is str else part[0].strip().decode(part[1] if part[1] else 'ascii'))
+        return ' '.join(result)
+    except:
+        return encoded
+
+def main():
+    if os.getuid() != 1000:
+        exit(0)
+
+    dbinit()
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--spam', action='store_true')
+    parser.add_argument('--ham', action='store_true')
+    parser.add_argument('--redraw', action='store_true')
+    args = parser.parse_args()
+
+    if not args.redraw:
+        headers = parse_mail()
+
+        received = get_received(headers)
+
+        id = headers.get('Message-ID', received)
+
+        if args.spam:
+            update(id, 1)
+        elif args.ham:
+            update(id, 0)
+        else:
+            rspam=get_rspamd_score(headers)
+            sa=get_spamass_score(headers)
+            rspam_b=get_rspamd_bayes(headers)
+            sa_b=get_spamass_bayes(headers)
+
+            insert(id=id,
+                   rcv=received,
+                   fr=get_header(headers, 'From', None),
+                   to=get_header(headers, 'To', None),
+                   subject=get_header(headers, 'Subject', None),
+                   rspam=rspam,
+                   rspam_b=rspam_b,
+                   sa=sa,
+                   sa_b=sa_b,
+                   spam=int(rspam is not None and rspam >= RSPAMD_SCORE or sa is not None and sa >= SA_SCORE))
+
+    update_hist('rspamd_score', RSPAMD_SCORE, 100)
+    update_hist('rspamd_bayes', 0, 100)
+    update_hist('spamass_score', SA_SCORE, 100)
+    update_hist('spamass_bayes', 0.5, 100)
+    dbclose()
+
+if __name__ == '__main__':
+    try:
+        main()
+    except:
+        traceback.print_exc()
+
+    exit(0)

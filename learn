@@ -1,0 +1,19 @@
+#!/bin/bash
+set -x
+
+case "$1" in
+--spam)
+        tee >(spamc -L spam) >(rspamc learn_spam) >(maillogger --spam 1>>~/maillog.log 2>&1) > /dev/null
+        ;;
+--ham)
+        tee >(spamc -L ham) >(rspamc learn_ham) >(maillogger --ham 1>>~/maillog.log 2>&1) > /dev/null
+        ;;
+esac
+
+jobs
+
+sleep 1
+
+jobs
+
+exit 0
